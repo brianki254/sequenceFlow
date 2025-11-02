@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 .env.local
+copilot-instructions.md
+DEPLOY.md
+DOCUMENTATION.md
+GITHUB_UPLOAD.md
+GOOGLE_CALENDAR_SETUP.md
 
 # Editor directories and files
 .vscode/*

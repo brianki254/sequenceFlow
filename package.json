@@ -11,6 +11,8 @@
     "deploy": "npm run build && gh-pages -d dist"
   },
   "dependencies": {
+    "@azure/msal-browser": "^4.26.2",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
     "@react-oauth/google": "^0.12.2",
     "gapi-script": "^1.2.0",
     "lucide-react": "^0.552.0",

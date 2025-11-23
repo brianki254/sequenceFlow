@@ -1,20 +1,32 @@
 import { useState, useEffect } from "react";
-import { ListTodo, Clock, Calendar, LogIn, LogOut, Bell, BellOff } from "lucide-react";
+import { ListTodo, Clock, Calendar, LogIn, LogOut, Bell, BellOff, User } from "lucide-react";
 import Button from "./components/Button";
 import TaskSchedulerPage from "./pages/TaskSchedulerPage";
 import ClockPage from "./pages/ClockPage";
 import CalendarPage from "./pages/CalendarPage";
+import AccountsPage from "./pages/AccountsPage";
 import { initGoogleAPI, signIn, signOut, isSignedIn } from "./services/googleCalendar";
+import { initOutlookAPI, signInToOutlook, signOutFromOutlook, isSignedInToOutlook } from "./services/outlookCalendar";
 import { requestNotificationPermission, areNotificationsEnabled, checkUpcomingTasks } from "./services/notifications";
+import { loadTasks, saveTasks, loadGroups, saveGroups, loadSettings, saveSettings } from "./services/storage";
 
 export default function App() {
-  const [activePage, setActivePage] = useState("clock");
+  // Load initial state from localStorage
+  const [activePage, setActivePage] = useState(() => {
+    const settings = loadSettings();
+    return settings.lastActiveTab || "clock";
+  });
   // Lifted app-level state so Calendar can see scheduled tasks
-  const [tasks, setTasks] = useState([]);
-  const [groups, setGroups] = useState([]);
+  const [tasks, setTasks] = useState(() => loadTasks());
+  const [groups, setGroups] = useState(() => loadGroups());
   const [googleSignedIn, setGoogleSignedIn] = useState(false);
   const [googleInitialized, setGoogleInitialized] = useState(false);
-  const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+  const [outlookSignedIn, setOutlookSignedIn] = useState(false);
+  const [outlookInitialized, setOutlookInitialized] = useState(false);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(() => {
+    const settings = loadSettings();
+    return settings.notificationsEnabled && areNotificationsEnabled();
+  });
 
   // Initialize Google API on mount
   useEffect(() => {
@@ -44,9 +56,41 @@ export default function App() {
       };
     }
 
+    // Initialize Outlook API
+    const initOutlook = async () => {
+      try {
+        const initialized = await initOutlookAPI();
+        setOutlookInitialized(initialized);
+        if (initialized) {
+          setOutlookSignedIn(isSignedInToOutlook());
+        }
+      } catch (error) {
+        console.error('Failed to initialize Outlook API:', error);
+      }
+    };
+    initOutlook();
+
     // Check notification permission
     setNotificationsEnabled(areNotificationsEnabled());
   }, []);
+
+  // Persist tasks to localStorage when they change
+  useEffect(() => {
+    saveTasks(tasks);
+  }, [tasks]);
+
+  // Persist groups to localStorage when they change
+  useEffect(() => {
+    saveGroups(groups);
+  }, [groups]);
+
+  // Persist settings when they change
+  useEffect(() => {
+    saveSettings({
+      notificationsEnabled,
+      lastActiveTab: activePage
+    });
+  }, [notificationsEnabled, activePage]);
 
   // Check for upcoming tasks and schedule notifications
   useEffect(() => {
@@ -86,6 +130,25 @@ export default function App() {
     setGoogleSignedIn(false);
   };
 
+  const handleOutlookSignIn = async () => {
+    try {
+      await signInToOutlook();
+      setOutlookSignedIn(true);
+    } catch (error) {
+      console.error('Outlook sign in failed:', error);
+      alert('Failed to sign in with Microsoft');
+    }
+  };
+
+  const handleOutlookSignOut = async () => {
+    try {
+      await signOutFromOutlook();
+      setOutlookSignedIn(false);
+    } catch (error) {
+      console.error('Outlook sign out failed:', error);
+    }
+  };
+
   const handleToggleNotifications = async () => {
     if (notificationsEnabled) {
       // Can't programmatically disable, user must do it in browser settings
@@ -97,6 +160,13 @@ export default function App() {
         alert('Notification permission denied. Enable it in your browser settings to receive task reminders.');
       }
     }
+  };
+
+  const handleClearData = () => {
+    setTasks([]);
+    setGroups([]);
+    setActivePage('clock');
+    setNotificationsEnabled(false);
   };
 
   return (
@@ -147,6 +217,20 @@ export default function App() {
             >
               <Calendar size={18} /> Calendar
             </Button>
+            <Button
+              variant={activePage === "accounts" ? "default" : "ghost"}
+              onClick={() => setActivePage("accounts")}
+              className="nav-btn"
+              style={activePage === "accounts" ? {
+                background: '#2563eb',
+                color: '#fff',
+                fontWeight: 700,
+                boxShadow: 'var(--shadow-md)',
+                border: 'none'
+              } : {}}
+            >
+              <User size={18} /> Accounts
+            </Button>
             </div>
             
             <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
@@ -162,32 +246,6 @@ export default function App() {
               >
                 {notificationsEnabled ? <Bell size={18} /> : <BellOff size={18} />}
               </Button>
-
-              {/* Google Sign-In Button */}
-              {googleInitialized && (
-                <div>
-                  {googleSignedIn ? (
-                    <Button
-                      variant="ghost"
-                      onClick={handleGoogleSignOut}
-                      className="nav-btn"
-                      title="Sign out from Google"
-                    >
-                      <LogOut size={18} /> Google
-                    </Button>
-                  ) : (
-                    <Button
-                      variant="outline"
-                      onClick={handleGoogleSignIn}
-                      className="btn-outline"
-                      style={{ padding: '0.5rem 1rem' }}
-                      title="Sign in with Google to sync calendar"
-                    >
-                      <LogIn size={18} /> Sign in with Google
-                    </Button>
-                  )}
-                </div>
-              )}
             </div>
           </div>
         </div>
@@ -200,10 +258,26 @@ export default function App() {
           groups={groups}
           setGroups={setGroups}
           googleSignedIn={googleSignedIn}
+          outlookSignedIn={outlookSignedIn}
         />
       )}
       {activePage === "clock" && <ClockPage />}
       {activePage === "calendar" && <CalendarPage tasks={tasks} />}
+      {activePage === "accounts" && (
+        <AccountsPage
+          googleSignedIn={googleSignedIn}
+          googleInitialized={googleInitialized}
+          outlookSignedIn={outlookSignedIn}
+          outlookInitialized={outlookInitialized}
+          onGoogleSignIn={handleGoogleSignIn}
+          onGoogleSignOut={handleGoogleSignOut}
+          onOutlookSignIn={handleOutlookSignIn}
+          onOutlookSignOut={handleOutlookSignOut}
+          onClearData={handleClearData}
+          tasks={tasks}
+          groups={groups}
+        />
+      )}
     </div>
   );
 }

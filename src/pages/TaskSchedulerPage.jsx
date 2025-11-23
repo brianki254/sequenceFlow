@@ -1,28 +1,49 @@
 import { useState, useMemo } from "react";
-import { ListTodo, Plus, Trash2, Check, Upload, Download } from "lucide-react";
+import { ListTodo, Plus, Trash2, Check, Upload, Download, Edit, Save, X, Clock, CheckCircle } from "lucide-react";
 import Button from "../components/Button";
 import TimeWheelPicker from "../components/TimeWheelPicker";
 import { exportTasksToGoogle, importEventsFromGoogle } from "../services/googleCalendar";
+import { exportTasksToOutlook, importEventsFromOutlook } from "../services/outlookCalendar";
 import { notifyTaskAdded, notifyTaskCompleted, areNotificationsEnabled } from "../services/notifications";
 
-export default function TaskSchedulerPage({ tasks: extTasks, setTasks: setExtTasks, groups: extGroups, setGroups: setExtGroups, googleSignedIn }) {
+export default function TaskSchedulerPage({ tasks: extTasks, setTasks: setExtTasks, groups: extGroups, setGroups: setExtGroups, googleSignedIn, outlookSignedIn }) {
   const useProvidedOrLocal = (data, setter, initial) => (Array.isArray(data) && typeof setter === 'function') ? [data, setter] : useState(initial);
   const [tasks, setTasks] = useProvidedOrLocal(extTasks, setExtTasks, []);
+  
+  // Simplified task creation state
   const [newTaskText, setNewTaskText] = useState("");
-  const todayIso = () => new Date().toISOString().slice(0, 10);
-  const toLocalDateTimeValue = (d = new Date()) => {
-    // produce YYYY-MM-DDTHH:MM for <input type="datetime-local">
-    const dt = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
-    return dt.toISOString().slice(0, 16);
-  };
-  const [newTaskStartAt, setNewTaskStartAt] = useState(toLocalDateTimeValue());
-  const [newTaskDurationValue, setNewTaskDurationValue] = useState(3);
-  const [newTaskDurationUnit, setNewTaskDurationUnit] = useState("days"); // minutes|hours|days
+  const [newTaskDurationValue, setNewTaskDurationValue] = useState(2);
+  const [newTaskDurationUnit, setNewTaskDurationUnit] = useState("hours"); // minutes|hours|days
   const [newTaskDependsOn, setNewTaskDependsOn] = useState("");
-  const [newTaskIsDaily, setNewTaskIsDaily] = useState(false);
-  const [newTaskDaysCount, setNewTaskDaysCount] = useState(3);
-  const [newTaskDailyStart, setNewTaskDailyStart] = useState("14:00");
-  const [newTaskDailyEnd, setNewTaskDailyEnd] = useState("16:00");
+  const [useManualSchedule, setUseManualSchedule] = useState(false);
+  const [manualStartDate, setManualStartDate] = useState(() => {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return tomorrow.toISOString().slice(0, 16);
+  });
+  
+  // Recurrent scheduling state
+  const [useRecurrentSchedule, setUseRecurrentSchedule] = useState(false);
+  const [recurrentFrequency, setRecurrentFrequency] = useState("daily"); // daily|weekly|monthly
+  const [recurrentStartDate, setRecurrentStartDate] = useState(() => {
+    const today = new Date();
+    return today.toISOString().slice(0, 10); // date only
+  });
+  const [recurrentEndDate, setRecurrentEndDate] = useState(() => {
+    const oneWeek = new Date();
+    oneWeek.setDate(oneWeek.getDate() + 7);
+    return oneWeek.toISOString().slice(0, 10); // date only
+  });
+  const [recurrentStartTime, setRecurrentStartTime] = useState("09:00");
+  const [chainRecurrentTasks, setChainRecurrentTasks] = useState(false);
+  
+  // Task editing state
+  const [editingTaskId, setEditingTaskId] = useState(null);
+  const [editTaskText, setEditTaskText] = useState("");
+  const [editTaskDuration, setEditTaskDuration] = useState(2);
+  const [editTaskDurationUnit, setEditTaskDurationUnit] = useState("hours");
+  const [editTaskStartAt, setEditTaskStartAt] = useState("");
+  
   // Groups
   const [groups, setGroups] = useProvidedOrLocal(extGroups, setExtGroups, []); // {id, name}
   const [newTaskGroupId, setNewTaskGroupId] = useState("");
@@ -54,96 +75,211 @@ export default function TaskSchedulerPage({ tasks: extTasks, setTasks: setExtTas
 
   const addTask = () => {
     if (newTaskText.trim() === "") return;
-    // compute dependency-adjusted start date/time
-    let startAt = newTaskStartAt;
-    let durationMinutes = toMinutes(newTaskDurationValue, newTaskDurationUnit);
-    let deps = [];
+    
+    const durationMinutes = toMinutes(newTaskDurationValue, newTaskDurationUnit);
     let groupId = newTaskGroupId || "";
-    if (newTaskDependsOn) {
-      const dep = findTaskById(newTaskDependsOn);
-      if (dep && dep.startAt && (dep.durationMinutes || dep.duration)) {
-        const depStart = parseDateTimeLocal(dep.startAt);
-        const depEnd = addMinutes(depStart, dep.durationMinutes ?? (Number(dep.duration) * 24 * 60));
-        if (!newTaskIsDaily) {
-          const desired = parseDateTimeLocal(startAt);
-          const minStart = addMinutes(depEnd, 1); // minute after dependency ends
-          if (desired < minStart) {
-            startAt = toLocalDateTimeValue(minStart);
-          }
-        }
-      }
-      deps = [String(newTaskDependsOn)];
-      // Inherit dependency group if none chosen
-      if (!groupId && dep && dep.groupId) {
-        groupId = dep.groupId;
-      }
-    }
-
-    let newTask;
-    if (newTaskIsDaily) {
-      // Daily window mode
-      const reqStartDT = parseDateTimeLocal(startAt);
-      let firstDay = floorToMidnight(reqStartDT);
-      const dailyStartMin = parseTimeToMinutes(newTaskDailyStart);
-      const dailyEndMinRaw = parseTimeToMinutes(newTaskDailyEnd);
-      const dailyEndMin = Math.max(dailyStartMin + 30, dailyEndMinRaw); // at least 30 min
-      // If dependency exists, push first day segment past dependency end
-      if (newTaskDependsOn) {
+    
+    // Helper function to create a single task
+    const createTask = (taskText, taskStartAt, taskId, isFirstInSeries = false) => {
+      let deps = [];
+      
+      // Handle dependency logic - for recurrent tasks, only first task gets the dependency
+      if (newTaskDependsOn && (!useRecurrentSchedule || isFirstInSeries)) {
         const dep = findTaskById(newTaskDependsOn);
-        if (dep && dep.startAt && (dep.durationMinutes || dep.duration)) {
-          const depStart = parseDateTimeLocal(dep.startAt);
-          const depEnd = addMinutes(depStart, dep.durationMinutes ?? (Number(dep.duration) * 24 * 60));
-          while (combineDateAndTime(firstDay, newTaskDailyStart) <= depEnd) {
-            firstDay = addDays(firstDay, 1);
+        if (dep && dep.startAt && dep.durationMinutes) {
+          const depStart = new Date(dep.startAt);
+          const depEnd = addMinutes(depStart, dep.durationMinutes);
+          
+          // For recurrent tasks, adjust the start date if needed
+          if (useRecurrentSchedule && isFirstInSeries) {
+            const requestedStart = new Date(taskStartAt);
+            if (requestedStart < depEnd) {
+              // Adjust the start time to be after dependency
+              const adjustedStart = new Date(depEnd.getTime() + 60000);
+              const dateStr = adjustedStart.toISOString().slice(0, 10);
+              const timeStr = adjustedStart.toTimeString().slice(0, 5);
+              taskStartAt = `${dateStr}T${timeStr}`;
+            }
+          } else if (useManualSchedule && !useRecurrentSchedule) {
+            // Check if manual start is after dependency for single tasks
+            const manualStart = new Date(manualStartDate);
+            if (manualStart < depEnd) {
+              alert(`Task cannot start before its dependency ends (${depEnd.toLocaleString()})`);
+              return null;
+            }
           }
         }
+        
+        deps = [String(newTaskDependsOn)];
+        // Inherit dependency group if none chosen
+        if (!groupId && dep && dep.groupId) {
+          groupId = dep.groupId;
+        }
       }
-      newTask = {
-        id: Date.now(),
-        text: newTaskText,
+      
+      return {
+        id: taskId || Date.now() + Math.random(),
+        text: taskText,
         completed: false,
-        createdAt: new Date().toLocaleString(),
-        mode: "daily",
-        firstDay: firstDay.toISOString().slice(0,10),
-        daysCount: Math.max(1, Number(newTaskDaysCount) || 1),
-        dailyStart: toHHMM(dailyStartMin),
-        dailyEnd: toHHMM(dailyEndMin),
-        // representative start/duration for sorting
-        startAt: toLocalDateTimeValue(combineDateAndTime(firstDay, toHHMM(dailyStartMin))),
-        durationMinutes: (dailyEndMin - dailyStartMin),
-        deps,
-        groupId
-      };
-    } else {
-      newTask = {
-        id: Date.now(),
-        text: newTaskText,
-        completed: false,
+        status: 'pending', // pending|in-progress|completed
         createdAt: new Date().toLocaleString(),
         mode: "continuous",
-        startAt,
-        durationMinutes,
+        startAt: taskStartAt,
+        durationMinutes: durationMinutes,
         deps,
-        groupId
+        groupId,
+        source: 'local'
       };
-    }
-    setTasks([newTask, ...tasks]);
+    };
     
-    // Notify about new task
-    if (areNotificationsEnabled()) {
-      notifyTaskAdded(newTask);
+    if (useRecurrentSchedule) {
+      // Generate recurrent tasks
+      const startDate = new Date(recurrentStartDate);
+      const endDate = new Date(recurrentEndDate);
+      const newTasks = [];
+      
+      if (startDate > endDate) {
+        alert("Start date must be before end date");
+        return;
+      }
+      
+      let currentDate = new Date(startDate);
+      let taskIndex = 1;
+      let previousTaskId = null;
+      
+      while (currentDate <= endDate) {
+        // Create datetime string
+        const dateStr = currentDate.toISOString().slice(0, 10);
+        let taskStartAt = `${dateStr}T${recurrentStartTime}`;
+        
+        const taskText = `${newTaskText} (${taskIndex})`;
+        const taskId = Date.now() + Math.random() + taskIndex;
+        const isFirstInSeries = taskIndex === 1;
+        
+        // Handle chaining logic
+        let taskDependency = "";
+        if (chainRecurrentTasks && previousTaskId) {
+          taskDependency = String(previousTaskId);
+        } else if (isFirstInSeries && newTaskDependsOn) {
+          taskDependency = newTaskDependsOn;
+        }
+        
+        // Temporarily override newTaskDependsOn for this task
+        const originalDependency = newTaskDependsOn;
+        if (chainRecurrentTasks && !isFirstInSeries) {
+          setNewTaskDependsOn(String(previousTaskId));
+        }
+        
+        const task = createTask(taskText, taskStartAt, taskId, isFirstInSeries);
+        
+        // Restore original dependency
+        setNewTaskDependsOn(originalDependency);
+        
+        if (task) {
+          // If chaining and not first task, calculate start time based on previous task
+          if (chainRecurrentTasks && previousTaskId && !isFirstInSeries) {
+            const previousTask = newTasks[newTasks.length - 1];
+            if (previousTask) {
+              const prevStart = new Date(previousTask.startAt);
+              const prevEnd = addMinutes(prevStart, previousTask.durationMinutes);
+              task.startAt = new Date(prevEnd.getTime() + 60000).toISOString().slice(0, 16);
+              task.deps = [String(previousTaskId)];
+            }
+          }
+          
+          newTasks.push(task);
+          previousTaskId = task.id;
+        }
+        
+        // Increment date based on frequency
+        if (recurrentFrequency === "daily") {
+          currentDate.setDate(currentDate.getDate() + 1);
+        } else if (recurrentFrequency === "weekly") {
+          currentDate.setDate(currentDate.getDate() + 7);
+        } else if (recurrentFrequency === "monthly") {
+          currentDate.setMonth(currentDate.getMonth() + 1);
+        }
+        
+        taskIndex++;
+        
+        // Safety check to prevent infinite loops
+        if (taskIndex > 365) {
+          alert("Cannot create more than 365 recurrent tasks");
+          break;
+        }
+      }
+      
+      if (newTasks.length > 0) {
+        setTasks([...newTasks, ...tasks]);
+        
+        // Notify about new tasks
+        if (areNotificationsEnabled()) {
+          newTasks.forEach(task => notifyTaskAdded(task));
+        }
+        
+        alert(`Created ${newTasks.length} recurrent tasks`);
+      }
+    } else {
+      // Single task (manual or automatic scheduling)
+      let startAt;
+      
+      if (newTaskDependsOn) {
+        const dep = findTaskById(newTaskDependsOn);
+        if (dep && dep.startAt && dep.durationMinutes) {
+          const depStart = new Date(dep.startAt);
+          const depEnd = addMinutes(depStart, dep.durationMinutes);
+          
+          if (useManualSchedule) {
+            // Check if manual start is after dependency
+            const manualStart = new Date(manualStartDate);
+            if (manualStart < depEnd) {
+              alert(`Task cannot start before its dependency ends (${depEnd.toLocaleString()})`);
+              return;
+            }
+            startAt = manualStartDate;
+          } else {
+            // Auto-schedule after dependency
+            startAt = new Date(depEnd.getTime() + 60000).toISOString().slice(0, 16); // 1 minute after
+          }
+        } else {
+          startAt = useManualSchedule ? manualStartDate : new Date().toISOString().slice(0, 16);
+        }
+      } else {
+        // No dependency
+        startAt = useManualSchedule ? manualStartDate : new Date().toISOString().slice(0, 16);
+      }
+      
+      const newTask = createTask(newTaskText, startAt);
+      if (newTask) {
+        setTasks([newTask, ...tasks]);
+        
+        // Notify about new task
+        if (areNotificationsEnabled()) {
+          notifyTaskAdded(newTask);
+        }
+      }
     }
     
+    // Reset form
     setNewTaskText("");
-    setNewTaskStartAt(toLocalDateTimeValue());
-    setNewTaskDurationValue(3);
-    setNewTaskDurationUnit("days");
-    setNewTaskIsDaily(false);
-    setNewTaskDaysCount(3);
-    setNewTaskDailyStart("14:00");
-    setNewTaskDailyEnd("16:00");
+    setNewTaskDurationValue(2);
+    setNewTaskDurationUnit("hours");
     setNewTaskDependsOn("");
     setNewTaskGroupId("");
+    setUseManualSchedule(false);
+    setUseRecurrentSchedule(false);
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    setManualStartDate(tomorrow.toISOString().slice(0, 16));
+    // Reset recurrent fields
+    setRecurrentFrequency("daily");
+    const today = new Date();
+    setRecurrentStartDate(today.toISOString().slice(0, 10));
+    const oneWeek = new Date();
+    oneWeek.setDate(oneWeek.getDate() + 7);
+    setRecurrentEndDate(oneWeek.toISOString().slice(0, 10));
+    setRecurrentStartTime("09:00");
+    setChainRecurrentTasks(false);
   };
 
   const addGroup = () => {
@@ -182,13 +318,73 @@ export default function TaskSchedulerPage({ tasks: extTasks, setTasks: setExtTas
     setTasks(tasks.filter(task => task.id !== taskId));
   };
 
+  const setTaskStatus = (taskId, status) => {
+    setTasks(prev => prev.map(task => {
+      if (task.id === taskId) {
+        const updatedTask = { ...task, status };
+        // Auto-set completed flag based on status
+        if (status === 'completed') {
+          updatedTask.completed = true;
+          // Notify about task completion
+          if (areNotificationsEnabled()) {
+            notifyTaskCompleted(updatedTask);
+          }
+        } else {
+          updatedTask.completed = false;
+        }
+        return updatedTask;
+      }
+      return task;
+    }));
+  };
+
+  const startEditingTask = (taskId) => {
+    const task = tasks.find(t => t.id === taskId);
+    if (task) {
+      setEditingTaskId(taskId);
+      setEditTaskText(task.text);
+      setEditTaskDuration(Math.floor(task.durationMinutes / 60) || 2);
+      setEditTaskDurationUnit(task.durationMinutes >= 60 ? "hours" : "minutes");
+      setEditTaskStartAt(task.startAt || "");
+    }
+  };
+
+  const saveTaskEdit = () => {
+    if (editTaskText.trim() === "") return;
+    
+    const durationMinutes = toMinutes(editTaskDuration, editTaskDurationUnit);
+    
+    setTasks(prev => prev.map(task => {
+      if (task.id === editingTaskId) {
+        return {
+          ...task,
+          text: editTaskText,
+          durationMinutes,
+          startAt: editTaskStartAt
+        };
+      }
+      return task;
+    }));
+    
+    cancelTaskEdit();
+  };
+
+  const cancelTaskEdit = () => {
+    setEditingTaskId(null);
+    setEditTaskText("");
+    setEditTaskDuration(2);
+    setEditTaskDurationUnit("hours");
+    setEditTaskStartAt("");
+  };
+
   const setTaskGroup = (taskId, groupId) => {
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, groupId: groupId || "" } : t));
   };
 
   const totalTasks = tasks.length;
-  const completedTasks = tasks.filter(task => task.completed).length;
-  const pendingTasks = totalTasks - completedTasks;
+  const completedTasks = tasks.filter(task => task.status === 'completed').length;
+  const inProgressTasks = tasks.filter(task => task.status === 'in-progress').length;
+  const pendingTasks = tasks.filter(task => task.status === 'pending').length;
 
   // Gantt data (hour-based width, day headers)
   const gantt = useMemo(() => {
@@ -242,10 +438,47 @@ export default function TaskSchedulerPage({ tasks: extTasks, setTasks: setExtTas
       const endDate = new Date(now.getFullYear(), now.getMonth() + 2, 0);
       
       const importedTasks = await importEventsFromGoogle(startDate, endDate);
-      setTasks(prev => [...importedTasks, ...prev]);
+      // Tag imported tasks with source
+      const taggedTasks = importedTasks.map(task => ({ ...task, source: 'google' }));
+      setTasks(prev => [...taggedTasks, ...prev]);
       alert(`Imported ${importedTasks.length} events from Google Calendar`);
     } catch (error) {
       console.error('Import failed:', error);
+      alert('Failed to import events: ' + error.message);
+    }
+  };
+
+  const handleExportToOutlook = async () => {
+    if (!outlookSignedIn) {
+      alert('Please sign in with Microsoft first');
+      return;
+    }
+    try {
+      const results = await exportTasksToOutlook(tasks);
+      alert(`Export complete!\n✓ ${results.success} tasks exported\n${results.errors > 0 ? `✗ ${results.errors} failed` : ''}`);
+    } catch (error) {
+      console.error('Outlook export failed:', error);
+      alert('Failed to export tasks: ' + error.message);
+    }
+  };
+
+  const handleImportFromOutlook = async () => {
+    if (!outlookSignedIn) {
+      alert('Please sign in with Microsoft first');
+      return;
+    }
+    try {
+      const now = new Date();
+      const startDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const endDate = new Date(now.getFullYear(), now.getMonth() + 2, 0);
+      
+      const importedTasks = await importEventsFromOutlook(startDate, endDate);
+      // Tag imported tasks with source
+      const taggedTasks = importedTasks.map(task => ({ ...task, source: 'outlook' }));
+      setTasks(prev => [...taggedTasks, ...prev]);
+      alert(`Imported ${importedTasks.length} events from Outlook Calendar`);
+    } catch (error) {
+      console.error('Outlook import failed:', error);
       alert('Failed to import events: ' + error.message);
     }
   };
@@ -257,157 +490,284 @@ export default function TaskSchedulerPage({ tasks: extTasks, setTasks: setExtTas
           <h1 style={{ color: 'var(--color-text)', fontWeight: 700, fontSize: '2rem', marginBottom: '0.75rem' }}>Task Scheduler</h1>
           <p style={{ color: 'var(--color-text-light)' }}>Organize your tasks and stay productive</p>
         </div>
-        {googleSignedIn && (
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
-            <Button onClick={handleExportToGoogle} className="btn-outline" title="Export tasks to Google Calendar">
-              <Upload size={16} /> Export
-            </Button>
-            <Button onClick={handleImportFromGoogle} className="btn-outline" title="Import events from Google Calendar">
-              <Download size={16} /> Import
-            </Button>
-          </div>
-        )}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          {/* Google Calendar Integration */}
+          {googleSignedIn && (
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.875rem', color: 'var(--color-text-light)', marginRight: '0.5rem' }}>Google:</span>
+              <Button onClick={handleExportToGoogle} className="btn-outline" title="Export tasks to Google Calendar">
+                <Upload size={16} /> Export
+              </Button>
+              <Button onClick={handleImportFromGoogle} className="btn-outline" title="Import events from Google Calendar">
+                <Download size={16} /> Import
+              </Button>
+            </div>
+          )}
+          {/* Outlook Calendar Integration */}
+          {outlookSignedIn && (
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.875rem', color: 'var(--color-text-light)', marginRight: '0.5rem' }}>Outlook:</span>
+              <Button onClick={handleExportToOutlook} className="btn-outline" title="Export tasks to Outlook Calendar">
+                <Upload size={16} /> Export
+              </Button>
+              <Button onClick={handleImportFromOutlook} className="btn-outline" title="Import events from Outlook Calendar">
+                <Download size={16} /> Import
+              </Button>
+            </div>
+          )}
+        </div>
       </div>
 
-      <div className="grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '1.5rem' }}>
+      <div className="grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', gap: '1rem', marginBottom: '1.5rem' }}>
         <div style={{ background: 'linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%)', borderRadius: 'var(--radius)', padding: '1.25rem' }}>
           <div style={{ color: 'var(--color-primary)', fontWeight: 700, fontSize: '2rem' }}>{totalTasks}</div>
           <div style={{ color: 'var(--color-text-light)', fontSize: '0.9rem' }}>Total Tasks</div>
+        </div>
+        <div style={{ background: 'linear-gradient(135deg, #f1f5f9 0%, #cbd5e1 100%)', borderRadius: 'var(--radius)', padding: '1.25rem' }}>
+          <div style={{ color: '#6b7280', fontWeight: 700, fontSize: '2rem' }}>{pendingTasks}</div>
+          <div style={{ color: 'var(--color-text-light)', fontSize: '0.9rem' }}>Pending</div>
+        </div>
+        <div style={{ background: 'linear-gradient(135deg, #fef3c7 0%, #fbbf24 100%)', borderRadius: 'var(--radius)', padding: '1.25rem' }}>
+          <div style={{ color: '#f59e0b', fontWeight: 700, fontSize: '2rem' }}>{inProgressTasks}</div>
+          <div style={{ color: 'var(--color-text-light)', fontSize: '0.9rem' }}>In Progress</div>
         </div>
         <div style={{ background: 'linear-gradient(135deg, #ecfdf5 0%, #bbf7d0 100%)', borderRadius: 'var(--radius)', padding: '1.25rem' }}>
           <div style={{ color: '#22c55e', fontWeight: 700, fontSize: '2rem' }}>{completedTasks}</div>
           <div style={{ color: 'var(--color-text-light)', fontSize: '0.9rem' }}>Completed</div>
         </div>
-        <div style={{ background: 'linear-gradient(135deg, #fff7ed 0%, #fed7aa 100%)', borderRadius: 'var(--radius)', padding: '1.25rem' }}>
-          <div style={{ color: '#f97316', fontWeight: 700, fontSize: '2rem' }}>{pendingTasks}</div>
-          <div style={{ color: 'var(--color-text-light)', fontSize: '0.9rem' }}>Pending</div>
-        </div>
       </div>
 
       <div className="card" style={{ marginBottom: '1.5rem', background: 'linear-gradient(135deg, #fff 0%, #f3f4f6 100%)' }}>
         {/* Row 1: Basic task inputs */}
-        <div className="flex gap-2" style={{ flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>
-          <input
-            type="text"
-            value={newTaskText}
-            onChange={(e) => setNewTaskText(e.target.value)}
-            onKeyPress={(e) => e.key === "Enter" && addTask()}
-            placeholder="Enter a new task..."
-            style={{ flex: 1, padding: '0.6rem 1rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', outline: 'none', fontSize: '1rem' }}
-          />
-          <input
-            type="datetime-local"
-            value={newTaskStartAt}
-            onChange={(e) => setNewTaskStartAt(e.target.value)}
-            title="Start date & time"
-            style={{ padding: '0.6rem 0.8rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
-          />
-          <select
-            value={newTaskDependsOn}
-            onChange={(e) => setNewTaskDependsOn(e.target.value)}
-            title="Depends on"
-            style={{ minWidth: 160, padding: '0.6rem 0.8rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', background: 'white' }}
-          >
-            <option value="">No dependency</option>
-            {tasks.map(t => (
-              <option key={t.id} value={t.id}>{t.text}</option>
-            ))}
-          </select>
-          <select
-            value={newTaskGroupId}
-            onChange={(e) => setNewTaskGroupId(e.target.value)}
-            title="Group"
-            style={{ minWidth: 160, padding: '0.6rem 0.8rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', background: 'white' }}
-          >
-            <option value="">No group</option>
-            {groups.map(g => (
-              <option key={g.id} value={g.id}>{g.name}</option>
-            ))}
-          </select>
-          <Button onClick={addTask} className="btn">
-            <Plus style={{ fontSize: 16 }} /> Add Task
-          </Button>
-        </div>
+        {/* Simplified Task Creation Form */}
+        <div style={{ background: 'white', padding: '1.5rem', borderRadius: 'var(--radius)', border: '1px solid var(--color-border)', marginBottom: '1rem' }}>
+          <h3 style={{ margin: '0 0 1rem 0', color: 'var(--color-text)', fontWeight: 600 }}>Add New Task</h3>
+          
+          {/* Task Name */}
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--color-text)', fontWeight: 500 }}>Task Name</label>
+            <input
+              type="text"
+              value={newTaskText}
+              onChange={(e) => setNewTaskText(e.target.value)}
+              onKeyPress={(e) => e.key === "Enter" && addTask()}
+              placeholder="Enter task description..."
+              style={{ width: '100%', padding: '0.75rem 1rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', outline: 'none', fontSize: '1rem' }}
+            />
+          </div>
 
-        {/* Row 2: Daily window controls (placed on a distinct line) */}
-        <div className="flex gap-2" style={{ gap: '0.5rem', alignItems: 'center', marginTop: '0.75rem' }}>
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-            <input type="checkbox" checked={newTaskIsDaily} onChange={(e) => setNewTaskIsDaily(e.target.checked)} />
-            <span style={{ color: 'var(--color-text-light)' }}>Daily time window</span>
-          </label>
-          {newTaskIsDaily && (
-            <>
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                <div style={{ color: 'var(--color-text-light)' }}>Start</div>
-                <TimeWheelPicker
-                  value={newTaskDailyStart}
-                  stepMinutes={5}
-                  onChange={(v) => {
-                    setNewTaskDailyStart(v);
-                    // ensure end >= start + 30 min
-                    const s = parseTimeToMinutes(v);
-                    const e = parseTimeToMinutes(newTaskDailyEnd);
-                    if (e <= s + 30) {
-                      const adjusted = (s + 30) % (24 * 60);
-                      const hh = String(Math.floor(adjusted / 60)).padStart(2, '0');
-                      const mm = String(adjusted % 60).padStart(2, '0');
-                      setNewTaskDailyEnd(`${hh}:${mm}`);
-                    }
-                  }}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem', marginBottom: '1rem' }}>
+            {/* Duration */}
+            <div>
+              <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--color-text)', fontWeight: 500 }}>Duration</label>
+              <div style={{ display: 'flex', gap: '0.5rem' }}>
+                <input
+                  type="number"
+                  min={1}
+                  value={newTaskDurationValue}
+                  onChange={(e) => setNewTaskDurationValue(e.target.value)}
+                  style={{ flex: 1, padding: '0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
                 />
+                <select
+                  value={newTaskDurationUnit}
+                  onChange={(e) => setNewTaskDurationUnit(e.target.value)}
+                  style={{ padding: '0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', background: 'white' }}
+                >
+                  <option value="minutes">minutes</option>
+                  <option value="hours">hours</option>
+                  <option value="days">days</option>
+                </select>
               </div>
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                <div style={{ color: 'var(--color-text-light)' }}>End</div>
-                <TimeWheelPicker
-                  value={newTaskDailyEnd}
-                  stepMinutes={5}
-                  onChange={(v) => {
-                    // ensure end >= start + 30 min
-                    const s = parseTimeToMinutes(newTaskDailyStart);
-                    const e = parseTimeToMinutes(v);
-                    if (e <= s + 30) {
-                      const adjusted = (s + 30) % (24 * 60);
-                      const hh = String(Math.floor(adjusted / 60)).padStart(2, '0');
-                      const mm = String(adjusted % 60).padStart(2, '0');
-                      setNewTaskDailyEnd(`${hh}:${mm}`);
-                    } else {
-                      setNewTaskDailyEnd(v);
-                    }
-                  }}
-                />
-              </div>
-              <input
-                type="number"
-                min={1}
-                value={newTaskDaysCount}
-                onChange={(e) => setNewTaskDaysCount(e.target.value)}
-                title="Number of days"
-                style={{ width: 140, padding: '0.5rem 0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
-              />
-            </>
-          )}
-          {!newTaskIsDaily && (
-            <>
-              <input
-                type="number"
-                min={1}
-                value={newTaskDurationValue}
-                onChange={(e) => setNewTaskDurationValue(e.target.value)}
-                title="Duration"
-                style={{ width: 120, padding: '0.5rem 0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
-              />
+            </div>
+
+            {/* Dependency */}
+            <div>
+              <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--color-text)', fontWeight: 500 }}>Dependency</label>
               <select
-                value={newTaskDurationUnit}
-                onChange={(e) => setNewTaskDurationUnit(e.target.value)}
-                title="Duration unit"
-                style={{ padding: '0.5rem 0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', background: 'white' }}
+                value={newTaskDependsOn}
+                onChange={(e) => setNewTaskDependsOn(e.target.value)}
+                style={{ width: '100%', padding: '0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', background: 'white' }}
+                title={useRecurrentSchedule ? "Dependencies will apply to the first task in the series" : "Select a task this depends on"}
               >
-                <option value="minutes">minutes</option>
-                <option value="hours">hours</option>
-                <option value="days">days</option>
+                <option value="">No dependency</option>
+                {tasks.map(t => (
+                  <option key={t.id} value={t.id}>{t.text}</option>
+                ))}
               </select>
-            </>
+              {useRecurrentSchedule && newTaskDependsOn && (
+                <div style={{ marginTop: '0.25rem', fontSize: '0.75rem', color: 'var(--color-text-light)' }}>
+                  Only the first recurrent task will depend on this task
+                </div>
+              )}
+            </div>
+
+            {/* Group */}
+            <div>
+              <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--color-text)', fontWeight: 500 }}>Group</label>
+              <select
+                value={newTaskGroupId}
+                onChange={(e) => setNewTaskGroupId(e.target.value)}
+                style={{ width: '100%', padding: '0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', background: 'white' }}
+              >
+                <option value="">No group</option>
+                {groups.map(g => (
+                  <option key={g.id} value={g.id}>{g.name}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Scheduling Mode */}
+          <div style={{ marginBottom: '1rem' }}>
+            <label style={{ display: 'block', marginBottom: '0.75rem', color: 'var(--color-text)', fontWeight: 500 }}>Scheduling</label>
+            <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  type="radio"
+                  name="scheduleMode"
+                  checked={!useManualSchedule && !useRecurrentSchedule}
+                  onChange={() => {
+                    setUseManualSchedule(false);
+                    setUseRecurrentSchedule(false);
+                  }}
+                  style={{ margin: 0 }}
+                />
+                <span style={{ color: 'var(--color-text)' }}>Automatic (schedule based on dependencies)</span>
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  type="radio"
+                  name="scheduleMode"
+                  checked={useManualSchedule && !useRecurrentSchedule}
+                  onChange={() => {
+                    setUseManualSchedule(true);
+                    setUseRecurrentSchedule(false);
+                  }}
+                  style={{ margin: 0 }}
+                />
+                <span style={{ color: 'var(--color-text)' }}>Manual start time</span>
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  type="radio"
+                  name="scheduleMode"
+                  checked={useRecurrentSchedule}
+                  onChange={() => {
+                    setUseManualSchedule(false);
+                    setUseRecurrentSchedule(true);
+                  }}
+                  style={{ margin: 0 }}
+                />
+                <span style={{ color: 'var(--color-text)' }}>Recurrent scheduling</span>
+              </label>
+            </div>
+          </div>
+
+          {/* Manual Start Date/Time */}
+          {useManualSchedule && !useRecurrentSchedule && (
+            <div style={{ marginBottom: '1rem' }}>
+              <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--color-text)', fontWeight: 500 }}>Start Date & Time</label>
+              <input
+                type="datetime-local"
+                value={manualStartDate}
+                onChange={(e) => setManualStartDate(e.target.value)}
+                style={{ padding: '0.75rem 1rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', fontSize: '1rem' }}
+              />
+            </div>
           )}
+
+          {/* Recurrent Controls */}
+          {useRecurrentSchedule && (
+            <div style={{ marginBottom: '1rem', padding: '1rem', background: 'var(--color-bg-light)', borderRadius: 'var(--radius)', border: '1px solid var(--color-border)' }}>
+              <h4 style={{ margin: '0 0 1rem 0', color: 'var(--color-text)', fontWeight: 600 }}>Recurrent Schedule Settings</h4>
+              
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem', marginBottom: '1rem' }}>
+                {/* Frequency */}
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--color-text)', fontWeight: 500 }}>Frequency</label>
+                  <select
+                    value={recurrentFrequency}
+                    onChange={(e) => setRecurrentFrequency(e.target.value)}
+                    style={{ width: '100%', padding: '0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', background: 'white' }}
+                  >
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly</option>
+                    <option value="monthly">Monthly</option>
+                  </select>
+                </div>
+
+                {/* Start Time */}
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--color-text)', fontWeight: 500 }}>Start Time</label>
+                  <input
+                    type="time"
+                    value={recurrentStartTime}
+                    onChange={(e) => setRecurrentStartTime(e.target.value)}
+                    style={{ width: '100%', padding: '0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
+                  />
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                {/* Start Date */}
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--color-text)', fontWeight: 500 }}>Start Date</label>
+                  <input
+                    type="date"
+                    value={recurrentStartDate}
+                    onChange={(e) => setRecurrentStartDate(e.target.value)}
+                    style={{ width: '100%', padding: '0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
+                  />
+                </div>
+
+                {/* End Date */}
+                <div>
+                  <label style={{ display: 'block', marginBottom: '0.5rem', color: 'var(--color-text)', fontWeight: 500 }}>End Date</label>
+                  <input
+                    type="date"
+                    value={recurrentEndDate}
+                    onChange={(e) => setRecurrentEndDate(e.target.value)}
+                    min={recurrentStartDate}
+                    style={{ width: '100%', padding: '0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
+                  />
+                </div>
+              </div>
+
+              <div style={{ marginTop: '0.75rem' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={chainRecurrentTasks}
+                    onChange={(e) => setChainRecurrentTasks(e.target.checked)}
+                    style={{ margin: 0 }}
+                  />
+                  <span style={{ color: 'var(--color-text)', fontSize: '0.9rem' }}>Chain tasks together (each task depends on the previous one)</span>
+                </label>
+              </div>
+
+              <div style={{ marginTop: '0.75rem', padding: '0.75rem', background: 'white', borderRadius: 'var(--radius)', color: 'var(--color-text-light)', fontSize: '0.875rem' }}>
+                <strong>Preview:</strong> This will create {recurrentFrequency} tasks from {recurrentStartDate} to {recurrentEndDate} at {recurrentStartTime}
+                {newTaskDependsOn && !chainRecurrentTasks && <><br />First task will depend on selected dependency</>}
+                {chainRecurrentTasks && <><br />Tasks will be chained together in sequence</>}
+                {newTaskDependsOn && chainRecurrentTasks && <><br />First task will depend on selected dependency, then chain together</>}
+              </div>
+            </div>
+          )}
+
+          {/* Add Task Button */}
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <Button 
+              onClick={addTask} 
+              className="btn"
+              disabled={!newTaskText.trim()}
+              style={{ 
+                opacity: newTaskText.trim() ? 1 : 0.5,
+                cursor: newTaskText.trim() ? 'pointer' : 'not-allowed'
+              }}
+            >
+              <Plus style={{ fontSize: 16 }} /> Add Task
+            </Button>
+          </div>
         </div>
         {/* Row 3: Group management */}
         <div className="flex gap-2" style={{ gap: '0.5rem', alignItems: 'center', marginTop: '0.75rem' }}>
@@ -526,69 +886,234 @@ export default function TaskSchedulerPage({ tasks: extTasks, setTasks: setExtTas
               }}
             >
               <div className="flex gap-2" style={{ alignItems: 'flex-start' }}>
-                <button
-                  onClick={() => toggleTask(task.id)}
-                  style={{ marginTop: 4, width: 22, height: 22, borderRadius: '50%', border: '2px solid', borderColor: task.completed ? '#22c55e' : 'var(--color-border)', background: task.completed ? '#22c55e' : 'transparent', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'border-color 0.2s, background 0.2s' }}
-                >
-                  {task.completed && <Check style={{ fontSize: 14, color: 'white' }} />}
-                </button>
-
-                <div style={{ flex: 1 }}>
-                  <div style={{ color: 'var(--color-text)', textDecoration: task.completed ? 'line-through' : 'none' }}>
-                    {task.text}
-                  </div>
-                  <div style={{ fontSize: '0.8rem', color: 'var(--color-text-light)', marginTop: 4 }}>
-                    Created: {task.createdAt}
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
-                    <div style={{ color: 'var(--color-text-light)', fontSize: '0.85rem' }}>Group:</div>
-                    {/* None chip */}
-                    <button
-                      type="button"
-                      onClick={() => setTaskGroup(task.id, "")}
-                      style={{
-                        padding: '0.2rem 0.6rem',
-                        borderRadius: 999,
-                        border: '1px solid var(--color-border)',
-                        background: task.groupId ? 'var(--color-surface)' : 'var(--color-primary)',
-                        color: task.groupId ? 'var(--color-text)' : 'white',
-                        fontSize: '0.8rem',
-                        cursor: 'pointer'
-                      }}
-                    >
-                      None
-                    </button>
-                    {groups.map(g => {
-                      const active = task.groupId === g.id;
-                      return (
-                        <button
-                          key={g.id}
-                          type="button"
-                          onClick={() => setTaskGroup(task.id, g.id)}
-                          title={`Assign to ${g.name}`}
-                          style={{
-                            padding: '0.2rem 0.6rem',
-                            borderRadius: 999,
-                            border: `1px solid ${active ? 'var(--color-primary)' : 'var(--color-border)'}`,
-                            background: active ? 'var(--color-primary)' : 'var(--color-surface)',
-                            color: active ? 'white' : 'var(--color-text)',
-                            fontSize: '0.8rem',
-                            cursor: 'pointer'
-                          }}
-                        >
-                          {g.name}
-                        </button>
-                      );
-                    })}
-                  </div>
+                {/* Status Buttons */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                  <button
+                    onClick={() => setTaskStatus(task.id, 'pending')}
+                    style={{ 
+                      width: 24, 
+                      height: 24, 
+                      borderRadius: '4px', 
+                      border: '2px solid', 
+                      borderColor: task.status === 'pending' ? '#6b7280' : 'var(--color-border)', 
+                      background: task.status === 'pending' ? '#6b7280' : 'transparent', 
+                      display: 'flex', 
+                      alignItems: 'center', 
+                      justifyContent: 'center', 
+                      cursor: 'pointer',
+                      transition: 'all 0.2s'
+                    }}
+                    title="Mark as Pending"
+                  >
+                    {task.status === 'pending' && <div style={{ width: 8, height: 8, background: 'white', borderRadius: '50%' }} />}
+                  </button>
+                  
+                  <button
+                    onClick={() => setTaskStatus(task.id, 'in-progress')}
+                    style={{ 
+                      width: 24, 
+                      height: 24, 
+                      borderRadius: '4px', 
+                      border: '2px solid', 
+                      borderColor: task.status === 'in-progress' ? '#f59e0b' : 'var(--color-border)', 
+                      background: task.status === 'in-progress' ? '#f59e0b' : 'transparent', 
+                      display: 'flex', 
+                      alignItems: 'center', 
+                      justifyContent: 'center', 
+                      cursor: 'pointer',
+                      transition: 'all 0.2s'
+                    }}
+                    title="Mark as In Progress"
+                  >
+                    {task.status === 'in-progress' && <Clock style={{ fontSize: 12, color: 'white' }} />}
+                  </button>
+                  
+                  <button
+                    onClick={() => setTaskStatus(task.id, 'completed')}
+                    style={{ 
+                      width: 24, 
+                      height: 24, 
+                      borderRadius: '4px', 
+                      border: '2px solid', 
+                      borderColor: task.status === 'completed' ? '#22c55e' : 'var(--color-border)', 
+                      background: task.status === 'completed' ? '#22c55e' : 'transparent', 
+                      display: 'flex', 
+                      alignItems: 'center', 
+                      justifyContent: 'center', 
+                      cursor: 'pointer',
+                      transition: 'all 0.2s'
+                    }}
+                    title="Mark as Completed"
+                  >
+                    {task.status === 'completed' && <Check style={{ fontSize: 12, color: 'white' }} />}
+                  </button>
                 </div>
 
-                <button
-                  onClick={() => deleteTask(task.id)}
-                  style={{ color: '#ef4444', background: 'none', border: 'none', cursor: 'pointer', transition: 'color 0.2s' }}
-                >
-                  <Trash2 style={{ fontSize: 18 }} />
-                </button>
+                <div style={{ flex: 1 }}>
+                  {editingTaskId === task.id ? (
+                    // Edit Mode
+                    <div style={{ background: '#f8fafc', padding: '1rem', borderRadius: 'var(--radius)', border: '1px solid var(--color-border)' }}>
+                      <div style={{ marginBottom: '0.75rem' }}>
+                        <label style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.875rem', fontWeight: 500 }}>Task Name</label>
+                        <input
+                          type="text"
+                          value={editTaskText}
+                          onChange={(e) => setEditTaskText(e.target.value)}
+                          style={{ width: '100%', padding: '0.5rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
+                        />
+                      </div>
+                      
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginBottom: '0.75rem' }}>
+                        <div>
+                          <label style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.875rem', fontWeight: 500 }}>Duration</label>
+                          <div style={{ display: 'flex', gap: '0.25rem' }}>
+                            <input
+                              type="number"
+                              min={1}
+                              value={editTaskDuration}
+                              onChange={(e) => setEditTaskDuration(e.target.value)}
+                              style={{ flex: 1, padding: '0.5rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
+                            />
+                            <select
+                              value={editTaskDurationUnit}
+                              onChange={(e) => setEditTaskDurationUnit(e.target.value)}
+                              style={{ padding: '0.5rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', background: 'white' }}
+                            >
+                              <option value="minutes">min</option>
+                              <option value="hours">hrs</option>
+                            </select>
+                          </div>
+                        </div>
+                        
+                        <div>
+                          <label style={{ display: 'block', marginBottom: '0.25rem', fontSize: '0.875rem', fontWeight: 500 }}>Start Time</label>
+                          <input
+                            type="datetime-local"
+                            value={editTaskStartAt}
+                            onChange={(e) => setEditTaskStartAt(e.target.value)}
+                            style={{ width: '100%', padding: '0.5rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)' }}
+                          />
+                        </div>
+                      </div>
+                      
+                      <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                        <button
+                          onClick={cancelTaskEdit}
+                          style={{ padding: '0.5rem 0.75rem', border: '1px solid var(--color-border)', borderRadius: 'var(--radius)', background: 'white', cursor: 'pointer' }}
+                        >
+                          <X style={{ fontSize: 14 }} /> Cancel
+                        </button>
+                        <button
+                          onClick={saveTaskEdit}
+                          disabled={!editTaskText.trim()}
+                          style={{ 
+                            padding: '0.5rem 0.75rem', 
+                            border: 'none', 
+                            borderRadius: 'var(--radius)', 
+                            background: editTaskText.trim() ? 'var(--color-primary)' : '#ccc', 
+                            color: 'white', 
+                            cursor: editTaskText.trim() ? 'pointer' : 'not-allowed' 
+                          }}
+                        >
+                          <Save style={{ fontSize: 14 }} /> Save
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    // View Mode
+                    <>
+                      <div style={{ 
+                        color: 'var(--color-text)', 
+                        textDecoration: task.status === 'completed' ? 'line-through' : 'none',
+                        opacity: task.status === 'completed' ? 0.7 : 1,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '0.5rem'
+                      }}>
+                        <span>{task.text}</span>
+                        <span style={{ 
+                          fontSize: '0.75rem', 
+                          padding: '0.2rem 0.5rem', 
+                          borderRadius: '12px', 
+                          background: task.status === 'pending' ? '#6b7280' : task.status === 'in-progress' ? '#f59e0b' : '#22c55e',
+                          color: 'white',
+                          fontWeight: 500
+                        }}>
+                          {task.status === 'in-progress' ? 'In Progress' : task.status.charAt(0).toUpperCase() + task.status.slice(1)}
+                        </span>
+                      </div>
+                      
+                      <div style={{ fontSize: '0.8rem', color: 'var(--color-text-light)', marginTop: 4, display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+                        <span>Created: {task.createdAt}</span>
+                        <span>Duration: {task.durationMinutes >= 60 ? `${Math.floor(task.durationMinutes / 60)}h ${task.durationMinutes % 60}m` : `${task.durationMinutes}m`}</span>
+                        {task.startAt && <span>Starts: {new Date(task.startAt).toLocaleString()}</span>}
+                      </div>
+                    </>
+                  )}
+                  
+                  {editingTaskId !== task.id && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+                      <div style={{ color: 'var(--color-text-light)', fontSize: '0.85rem' }}>Group:</div>
+                      {/* None chip */}
+                      <button
+                        type="button"
+                        onClick={() => setTaskGroup(task.id, "")}
+                        style={{
+                          padding: '0.2rem 0.6rem',
+                          borderRadius: 999,
+                          border: '1px solid var(--color-border)',
+                          background: task.groupId ? 'var(--color-surface)' : 'var(--color-primary)',
+                          color: task.groupId ? 'var(--color-text)' : 'white',
+                          fontSize: '0.8rem',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        None
+                      </button>
+                      {groups.map(g => {
+                        const active = task.groupId === g.id;
+                        return (
+                          <button
+                            key={g.id}
+                            type="button"
+                            onClick={() => setTaskGroup(task.id, g.id)}
+                            title={`Assign to ${g.name}`}
+                            style={{
+                              padding: '0.2rem 0.6rem',
+                              borderRadius: 999,
+                              border: `1px solid ${active ? 'var(--color-primary)' : 'var(--color-border)'}`,
+                              background: active ? 'var(--color-primary)' : 'var(--color-surface)',
+                              color: active ? 'white' : 'var(--color-text)',
+                              fontSize: '0.8rem',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            {g.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                  {editingTaskId !== task.id && (
+                    <button
+                      onClick={() => startEditingTask(task.id)}
+                      style={{ color: 'var(--color-primary)', background: 'none', border: 'none', cursor: 'pointer', padding: '0.25rem' }}
+                      title="Edit task"
+                    >
+                      <Edit style={{ fontSize: 16 }} />
+                    </button>
+                  )}
+                  <button
+                    onClick={() => deleteTask(task.id)}
+                    style={{ color: '#ef4444', background: 'none', border: 'none', cursor: 'pointer', padding: '0.25rem' }}
+                    title="Delete task"
+                  >
+                    <Trash2 style={{ fontSize: 16 }} />
+                  </button>
+                </div>
               </div>
             </div>
           ))

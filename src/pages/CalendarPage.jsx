@@ -32,6 +32,44 @@ export default function CalendarPage({ tasks = [] }) {
   const combineDateAndTime = (dateOnly, hhmm) => new Date(floorToMidnight(dateOnly).getTime() + parseTimeToMinutes(hhmm) * 60000);
 
   // Build a map of YYYY-MM-DD -> [{id, text, mode}]
+  const getTaskStyle = (task) => {
+    const baseStyle = {
+      fontSize: '0.75rem',
+      padding: '0.25rem 0.5rem',
+      borderRadius: '0.25rem',
+      marginBottom: '0.25rem',
+      color: 'white',
+      fontWeight: 500
+    };
+
+    // Different colors based on source
+    if (task.source === 'google') {
+      return {
+        ...baseStyle,
+        background: task.completed ? 
+          'linear-gradient(90deg, #34d399, #10b981)' : 
+          'linear-gradient(90deg, #3b82f6, #1d4ed8)',
+        border: '1px solid rgba(59, 130, 246, 0.3)'
+      };
+    } else if (task.source === 'outlook') {
+      return {
+        ...baseStyle,
+        background: task.completed ? 
+          'linear-gradient(90deg, #f59e0b, #d97706)' : 
+          'linear-gradient(90deg, #8b5cf6, #7c3aed)',
+        border: '1px solid rgba(139, 92, 246, 0.3)'
+      };
+    } else {
+      // Local tasks (default)
+      return {
+        ...baseStyle,
+        background: task.completed ? 
+          'linear-gradient(90deg, #22c55e, #16a34a)' : 
+          'linear-gradient(90deg, #2563eb, #9333ea)'
+      };
+    }
+  };
+
   const tasksByDate = useMemo(() => {
     const map = new Map();
     const toDateKey = (d) => {
@@ -140,15 +178,25 @@ export default function CalendarPage({ tasks = [] }) {
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     {preview.map(t => (
-                      <div key={t.id} title={t.text} style={{
+                      <div key={t.id} title={`${t.text} (${t.source || 'local'})`} style={{
                         fontSize: '0.75rem',
                         whiteSpace: 'nowrap',
                         overflow: 'hidden',
                         textOverflow: 'ellipsis',
                         padding: '2px 6px',
                         borderRadius: 999,
-                        background: t.completed ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #2563eb, #9333ea)',
-                        color: 'white'
+                        background: (() => {
+                          if (t.source === 'google') {
+                            return t.completed ? 'linear-gradient(90deg, #34d399, #10b981)' : 'linear-gradient(90deg, #3b82f6, #1d4ed8)';
+                          } else if (t.source === 'outlook') {
+                            return t.completed ? 'linear-gradient(90deg, #f59e0b, #d97706)' : 'linear-gradient(90deg, #8b5cf6, #7c3aed)';
+                          } else {
+                            return t.completed ? 'linear-gradient(90deg, #22c55e, #16a34a)' : 'linear-gradient(90deg, #2563eb, #9333ea)';
+                          }
+                        })(),
+                        color: 'white',
+                        border: t.source === 'google' ? '1px solid rgba(59, 130, 246, 0.3)' : 
+                                t.source === 'outlook' ? '1px solid rgba(139, 92, 246, 0.3)' : 'none'
                       }}>
                         {t.text}
                       </div>
@@ -165,9 +213,26 @@ export default function CalendarPage({ tasks = [] }) {
       </div>
 
       <div style={{ marginTop: '1.5rem', background: 'linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%)', borderRadius: 'var(--radius)', padding: '1rem', border: '1px solid #93c5fd' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.95rem', color: 'var(--color-text-light)' }}>
-          <div style={{ width: 16, height: 16, background: 'linear-gradient(135deg, #2563eb 0%, #9333ea 100%)', borderRadius: '50%' }}></div>
-          <span>Today's date is highlighted in blue</span>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', fontSize: '0.875rem', color: 'var(--color-text-light)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <div style={{ width: 16, height: 16, background: 'linear-gradient(135deg, #2563eb 0%, #9333ea 100%)', borderRadius: '50%' }}></div>
+            <span>Today's date is highlighted in blue</span>
+          </div>
+          <div style={{ fontSize: '0.8rem', fontWeight: 600, marginTop: '0.5rem', color: 'var(--color-text)' }}>Task Sources:</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.5rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <div style={{ width: 12, height: 12, background: 'linear-gradient(90deg, #2563eb, #9333ea)', borderRadius: '2px' }}></div>
+              <span>Local Tasks</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <div style={{ width: 12, height: 12, background: 'linear-gradient(90deg, #3b82f6, #1d4ed8)', borderRadius: '2px', border: '1px solid rgba(59, 130, 246, 0.3)' }}></div>
+              <span>Google Calendar</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <div style={{ width: 12, height: 12, background: 'linear-gradient(90deg, #8b5cf6, #7c3aed)', borderRadius: '2px', border: '1px solid rgba(139, 92, 246, 0.3)' }}></div>
+              <span>Outlook Calendar</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
